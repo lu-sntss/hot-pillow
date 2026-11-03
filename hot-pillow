@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+#
+# hot-pillow — mostra a temperatura da CPU na barra do Omarchy e avisa
+# quando ela passa do limite que você escolher.
+#
+# Uso:
+#   hot-pillow            mostra a temperatura (widget principal da barra)
+#   hot-pillow alertas    mostra quantos alertas aconteceram (widget que pisca)
+#   hot-pillow zerar      zera o contador de alertas
+#   hot-pillow ajuda      mostra esta ajuda
+#
+# Licença: MIT — veja o arquivo LICENSE.
+
+# ---------------------------------------------------------------------------
+# Onde ficam as coisas
+# ---------------------------------------------------------------------------
+# As variáveis HOT_PILLOW_* existem só para os testes conseguirem usar
+# sensores e pastas "de mentira". No uso normal, ninguém precisa mexer nelas.
+
+ARQUIVO_CONFIG="${HOT_PILLOW_CONFIG:-$HOME/.config/hot-pillow/config}"
+PASTA_SENSORES="${HOT_PILLOW_SENSORES:-/sys/class/hwmon}"
+PASTA_ESTADO="${HOT_PILLOW_ESTADO:-${XDG_RUNTIME_DIR:-/tmp}/hot-pillow}"
+
+# Arquivo que existe enquanto a CPU está "em alerta" (para avisar só uma vez).
+ARQUIVO_EM_ALERTA="$PASTA_ESTADO/em-alerta"
+# Arquivo com o número de alertas desde o último "zerar".
+ARQUIVO_CONTADOR="$PASTA_ESTADO/contador"
+
+# Sensores de CPU que conhecemos, do mais preciso para o mais genérico:
+#   k10temp / zenpower = AMD Ryzen
+#   coretemp           = Intel
+#   cpu_thermal        = Raspberry Pi e outros ARM
+#   acpitz             = sensor genérico da placa-mãe (último recurso)
+SENSORES_CPU="k10temp zenpower coretemp cpu_thermal acpitz"
+# Sensores de GPU (opcional, só aparece na dica ao passar o mouse).
+SENSORES_GPU="amdgpu nouveau"
+
+# Ícones (precisam de uma Nerd Font, que o Omarchy já usa na barra).
+ICONE_NORMAL=$''  # termômetro
+ICONE_QUENTE=$''  # fogo
+ICONE_ALERTA=$''  # triângulo de aviso
+
+# ---------------------------------------------------------------------------
+# Configuração
+# ---------------------------------------------------------------------------
+
+# Valores padrão. O arquivo de configuração pode trocar eles.
+LIMITE_PADRAO=75
+REARMAR_PADRAO=70
+
+# carregar_config: lê o arquivo de configuração do usuário e confere se os
+# valores fazem sentido. Se algo estiver errado (ou o arquivo não existir),
+# usa os valores padrão e guarda um aviso para mostrar na dica da barra.
+#
+# Argumentos:
+#   nenhum
+#
+# Retorna:
+#   nada (sem saída); define as variáveis globais ALERTA_TEMP, REARMAR_TEMP
+#   e AVISO_CONFIG, usadas pelo resto do script
+carregar_config() {
+  ALERTA_TEMP=$LIMITE_PADRAO
+  REARMAR_TEMP=$REARMAR_PADRAO
+  AVISO_CONFIG=""
+
+  if [[ -f "$ARQUIVO_CONFIG" ]]; then
+    # shellcheck source=/dev/null
+    source "$ARQUIVO_CONFIG"
+  fi
+
+  if ! eh_numero "$ALERTA_TEMP"; then
+    AVISO_CONFIG="ALERTA_TEMP inválido, usando ${LIMITE_PADRAO}°C"
+    ALERTA_TEMP=$LIMITE_PADRAO
+  fi
+
+  if ! eh_numero "$REARMAR_TEMP" || (( REARMAR_TEMP >= ALERTA_TEMP )); then
+    AVISO_CONFIG="REARMAR_TEMP precisa ser menor que ALERTA_TEMP, usando $(( ALERTA_TEMP - 5 ))°C"
+    REARMAR_TEMP=$(( ALERTA_TEMP - 5 ))
+  fi
+}
+
+# Responde "sim" (código 0) se o texto for um número inteiro positivo.
+eh_numero() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# ---------------------------------------------------------------------------
+# Sensores
+# ---------------------------------------------------------------------------
+
+# ler_temperatura: procura, numa lista de sensores, o primeiro que existir
+# de verdade no sistema, e imprime a temperatura dele.
+#
+# Cada sensor do kernel é uma pasta em /sys/class/hwmon com:
+#   name         -> nome do sensor (ex.: k10temp)
+#   temp1_input  -> temperatura em milésimos de grau (ex.: 48000 = 48°C)
+#
+# Argumentos:
+#   $1 - nomes de sensor a procurar, em ordem de preferência, separados
+#        por espaço (ex.: "k10temp zenpower coretemp")
+#
+# Retorna:
+#   imprime (stdout) a temperatura em °C do primeiro sensor encontrado;
+#   não imprime nada se nenhum sensor da lista existir no sistema
+ler_temperatura() {
+  local nome_procurado pasta
+
+  for nome_procurado in $1; do
+    for pasta in "$PASTA_SENSORES"/*; do
+      if [[ "$(cat "$pasta/name" 2>/dev/null)" == "$nome_procurado" && -r "$pasta/temp1_input" ]]; then
+        echo $(( $(cat "$pasta/temp1_input") / 1000 ))
+        return
+      fi
+    done
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Contador de alertas
+# ---------------------------------------------------------------------------
+
+# ler_contador: lê quantas vezes a CPU já passou do limite desde o último
+# "zerar". Se o arquivo não existir ou tiver algo que não seja um número
+# (por exemplo, se foi corrompido), trata como se fosse zero.
+#
+# Argumentos:
+#   nenhum
+#
+# Retorna:
+#   imprime (stdout) o número de alertas, sempre um inteiro válido
+ler_contador() {
+  local contador
+  contador=$(cat "$ARQUIVO_CONTADOR" 2>/dev/null)
+
+  if eh_numero "$contador"; then
+    echo "$contador"
+  else
+    echo 0
+  fi
+}
+
+# Soma 1 no contador de alertas.
+somar_um_no_contador() {
+  echo $(( $(ler_contador) + 1 )) > "$ARQUIVO_CONTADOR"
+}
+
+# ---------------------------------------------------------------------------
+# Notificação
+# ---------------------------------------------------------------------------
+
+# notificar: manda uma notificação do sistema avisando que a CPU esquentou.
+#
+# Argumentos:
+#   $1 - a temperatura atual da CPU, em °C, só para mostrar na mensagem
+#
+# Retorna:
+#   nada; manda a notificação como efeito colateral (ou não faz nada se o
+#   sistema não tiver o notify-send)
+notificar() {
+  local temp=$1
+
+  # Se o sistema não tiver notify-send, só não avisa (a barra ainda acende).
+  if ! command -v notify-send > /dev/null; then
+    return
+  fi
+
+  # Urgência "normal" com 10s: a "critical" nunca some sozinha no Omarchy.
+  notify-send -u normal -t 10000 -i dialog-warning \
+    "CPU quente: ${temp}°C" \
+    "Passou de ${ALERTA_TEMP}°C. Clique na temperatura na barra para ver o que está pesando."
+}
+
+# ---------------------------------------------------------------------------
+# Saída para a barra
+# ---------------------------------------------------------------------------
+# A barra do Omarchy entende um JSON no formato do Waybar:
+#   {"text": "...", "tooltip": "...", "class": "active"}
+# "text" aparece na barra, "tooltip" ao passar o mouse e "class": "active"
+# deixa o widget destacado (aceso).
+
+# imprimir_json: monta e imprime o JSON que a barra do Omarchy espera
+# (formato Waybar).
+#
+# Argumentos:
+#   $1 - texto que aparece na barra (ex.: " 58°")
+#   $2 - dica que aparece ao passar o mouse
+#   $3 - "sim" para o widget aparecer aceso/destacado, qualquer outra
+#        coisa (ex.: "nao") para aparecer normal
+#
+# Retorna:
+#   imprime (stdout) uma linha de JSON
+imprimir_json() {
+  local texto=$1 dica=$2 aceso=$3
+
+  if [[ "$aceso" == "sim" ]]; then
+    echo "{\"text\":\"$texto\",\"tooltip\":\"$dica\",\"class\":\"active\"}"
+  else
+    echo "{\"text\":\"$texto\",\"tooltip\":\"$dica\"}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Modos
+# ---------------------------------------------------------------------------
+
+# mostrar_temperatura: modo principal do script (o que a barra roda a cada
+# 5s). Lê a temperatura, decide se passou do limite e, se for a primeira
+# vez que passa, soma no contador de alertas e dispara a notificação.
+#
+# Argumentos:
+#   nenhum (usa as globais ALERTA_TEMP/REARMAR_TEMP/AVISO_CONFIG, já
+#   carregadas por carregar_config)
+#
+# Retorna:
+#   imprime (stdout) o JSON da temperatura para a barra
+mostrar_temperatura() {
+  local cpu gpu dica
+
+  cpu=$(ler_temperatura "$SENSORES_CPU")
+  gpu=$(ler_temperatura "$SENSORES_GPU")
+
+  if [[ -z "$cpu" ]]; then
+    imprimir_json "$ICONE_NORMAL ?" "Nenhum sensor de CPU encontrado" "nao"
+    return
+  fi
+
+  # "\\n" vira "\n" no JSON, que é a quebra de linha da dica.
+  dica="CPU: ${cpu}°C"
+  if [[ -n "$gpu" ]]; then
+    dica="$dica\\nGPU: ${gpu}°C"
+  fi
+  dica="$dica\\nAlerta em ${ALERTA_TEMP}°C"
+  if [[ -n "$AVISO_CONFIG" ]]; then
+    dica="$dica\\n⚠ Config: $AVISO_CONFIG"
+  fi
+
+  if (( cpu >= ALERTA_TEMP )); then
+    # Só avisa na primeira vez que passa do limite. O aviso volta a valer
+    # depois que a temperatura cair abaixo de REARMAR_TEMP.
+    if [[ ! -f "$ARQUIVO_EM_ALERTA" ]]; then
+      touch "$ARQUIVO_EM_ALERTA"
+      somar_um_no_contador
+      notificar "$cpu"
+    fi
+    imprimir_json "$ICONE_QUENTE ${cpu}°" "$dica" "sim"
+    return
+  fi
+
+  if (( cpu < REARMAR_TEMP )); then
+    rm -f "$ARQUIVO_EM_ALERTA"
+  fi
+  imprimir_json "$ICONE_NORMAL ${cpu}°" "$dica" "nao"
+}
+
+# mostrar_alertas: modo do widget que mostra quantos alertas aconteceram.
+# Fica invisível quando o contador é zero; quando há alertas, pisca
+# (alterna aceso/apagado a cada segundo) até alguém clicar para zerar.
+#
+# Argumentos:
+#   nenhum
+#
+# Retorna:
+#   imprime (stdout) o JSON do contador, ou nada se o contador for zero
+mostrar_alertas() {
+  local contador palavra aceso
+
+  contador=$(ler_contador)
+
+  # Sem alertas: não imprime nada e o widget some da barra.
+  # (Não dá para imprimir {"text":""}: a barra trata texto vazio como
+  # "sem texto" e mostra o JSON inteiro no lugar.)
+  if (( contador == 0 )); then
+    return
+  fi
+
+  palavra="ALERTAS"
+  if (( contador == 1 )); then
+    palavra="ALERTA"
+  fi
+
+  # Pisca: acende nos segundos pares e apaga nos ímpares.
+  aceso="nao"
+  if (( $(date +%s) % 2 == 0 )); then
+    aceso="sim"
+  fi
+
+  imprimir_json "$ICONE_ALERTA $contador $palavra!" \
+    "$contador alerta(s) de temperatura. Clique para zerar." "$aceso"
+}
+
+# Zera o contador de alertas.
+zerar_alertas() {
+  rm -f "$ARQUIVO_CONTADOR"
+}
+
+# mostrar_ajuda: mostra o texto de ajuda. Em vez de repetir o texto aqui,
+# lê e imprime as próprias linhas 3–12 deste arquivo (o cabeçalho de uso lá
+# em cima), para nunca ficar desatualizada.
+#
+# Argumentos:
+#   nenhum
+#
+# Retorna:
+#   imprime (stdout) o texto de ajuda
+mostrar_ajuda() {
+  sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# ---------------------------------------------------------------------------
+# Início
+# ---------------------------------------------------------------------------
+
+mkdir -p "$PASTA_ESTADO"
+carregar_config
+
+case "${1:-}" in
+  "")      mostrar_temperatura ;;
+  alertas) mostrar_alertas ;;
+  zerar)   zerar_alertas ;;
+  ajuda | -h | --help) mostrar_ajuda ;;
+  *)
+    echo "Modo desconhecido: $1" >&2
+    mostrar_ajuda >&2
+    exit 1
+    ;;
+esac

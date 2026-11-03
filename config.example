@@ -1,0 +1,12 @@
+# Configuração do hot-pillow
+# Copie para ~/.config/hot-pillow/config (o install.sh já faz isso).
+# As mudanças valem na próxima atualização da barra (alguns segundos).
+
+# A partir de quantos graus (°C) a CPU está "quente":
+# a temperatura na barra acende, aparece uma notificação e o contador sobe.
+ALERTA_TEMP=75
+
+# Depois de um alerta, só avisa de novo quando a CPU esfriar abaixo disto.
+# Evita uma chuva de notificações quando a temperatura fica oscilando
+# em volta do limite. Precisa ser menor que ALERTA_TEMP.
+REARMAR_TEMP=70
