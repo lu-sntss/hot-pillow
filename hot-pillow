@@ -21,10 +21,12 @@ ARQUIVO_CONFIG="${HOT_PILLOW_CONFIG:-$HOME/.config/hot-pillow/config}"
 PASTA_SENSORES="${HOT_PILLOW_SENSORES:-/sys/class/hwmon}"
 PASTA_ESTADO="${HOT_PILLOW_ESTADO:-${XDG_RUNTIME_DIR:-/tmp}/hot-pillow}"
 
-# Arquivo que existe enquanto a CPU está "em alerta" (para avisar só uma vez).
-ARQUIVO_EM_ALERTA="$PASTA_ESTADO/em-alerta"
-# Arquivo com o número de alertas desde o último "zerar".
-ARQUIVO_CONTADOR="$PASTA_ESTADO/contador"
+# Estado que sobrevive entre uma chamada e outra do script (cada chamada é
+# um processo novo — nada em memória sobrevive sozinho). Um arquivo só, com
+# todos os campos, lido/gravado por ler_estado/escrever_estado, protegido
+# por travar_estado/destravar_estado.
+ARQUIVO_ESTADO="$PASTA_ESTADO/estado"
+ARQUIVO_ESTADO_LOCK="$PASTA_ESTADO/estado.lock"
 
 # Sensores de CPU que conhecemos, do mais preciso para o mais genérico:
 #   k10temp / zenpower = AMD Ryzen
@@ -116,32 +118,49 @@ ler_temperatura() {
 }
 
 # ---------------------------------------------------------------------------
-# Contador de alertas
+# Estado persistido
 # ---------------------------------------------------------------------------
 
-# ler_contador: lê quantas vezes a CPU já passou do limite desde o último
-# "zerar". Se o arquivo não existir ou tiver algo que não seja um número
-# (por exemplo, se foi corrompido), trata como se fosse zero.
+# Tranca o estado. Toda leitura ou escrita de $ARQUIVO_ESTADO deve rodar
+# entre travar_estado e destravar_estado.
+travar_estado() {
+  exec 200>"$ARQUIVO_ESTADO_LOCK"
+  flock -x 200
+}
+
+# Destranca o estado.
+destravar_estado() {
+  flock -u 200
+}
+
+# ler_estado: lê EM_ALERTA e CONTADOR do arquivo de estado. Se o arquivo
+# não existir ou tiver algo inválido, usa os valores padrão.
 #
 # Argumentos:
 #   nenhum
 #
 # Retorna:
-#   imprime (stdout) o número de alertas, sempre um inteiro válido
-ler_contador() {
-  local contador
-  contador=$(cat "$ARQUIVO_CONTADOR" 2>/dev/null)
+#   nada (sem saída); define as variáveis globais EM_ALERTA ("1" ou "0") e
+#   CONTADOR (inteiro)
+ler_estado() {
+  EM_ALERTA=0
+  CONTADOR=0
 
-  if eh_numero "$contador"; then
-    echo "$contador"
-  else
-    echo 0
+  if [[ -f "$ARQUIVO_ESTADO" ]]; then
+    # shellcheck source=/dev/null
+    source "$ARQUIVO_ESTADO"
   fi
+
+  eh_numero "$CONTADOR" || CONTADOR=0
+  [[ "$EM_ALERTA" == "1" ]] || EM_ALERTA=0
 }
 
-# Soma 1 no contador de alertas.
-somar_um_no_contador() {
-  echo $(( $(ler_contador) + 1 )) > "$ARQUIVO_CONTADOR"
+# Grava EM_ALERTA e CONTADOR no arquivo de estado.
+escrever_estado() {
+  {
+    echo "EM_ALERTA=$EM_ALERTA"
+    echo "CONTADOR=$CONTADOR"
+  } > "$ARQUIVO_ESTADO"
 }
 
 # ---------------------------------------------------------------------------
@@ -208,13 +227,13 @@ imprimir_json() {
 # vez que passa, soma no contador de alertas e dispara a notificação.
 #
 # Argumentos:
-#   nenhum (usa as globais ALERTA_TEMP/REARMAR_TEMP/AVISO_CONFIG, já
-#   carregadas por carregar_config)
+#   nenhum (usa ALERTA_TEMP/REARMAR_TEMP/AVISO_CONFIG, já carregadas por
+#   carregar_config; lê/escreve o estado por conta própria, com trava)
 #
 # Retorna:
 #   imprime (stdout) o JSON da temperatura para a barra
 mostrar_temperatura() {
-  local cpu gpu dica
+  local cpu gpu dica precisa_notificar em_alerta_antes contador_antes
 
   cpu=$(ler_temperatura "$SENSORES_CPU")
   gpu=$(ler_temperatura "$SENSORES_GPU")
@@ -234,22 +253,40 @@ mostrar_temperatura() {
     dica="$dica\\n⚠ Config: $AVISO_CONFIG"
   fi
 
+  precisa_notificar=0
+  travar_estado
+  ler_estado
+  em_alerta_antes=$EM_ALERTA
+  contador_antes=$CONTADOR
+
   if (( cpu >= ALERTA_TEMP )); then
     # Só avisa na primeira vez que passa do limite. O aviso volta a valer
     # depois que a temperatura cair abaixo de REARMAR_TEMP.
-    if [[ ! -f "$ARQUIVO_EM_ALERTA" ]]; then
-      touch "$ARQUIVO_EM_ALERTA"
-      somar_um_no_contador
-      notificar "$cpu"
+    if [[ "$EM_ALERTA" != "1" ]]; then
+      EM_ALERTA=1
+      CONTADOR=$(( CONTADOR + 1 ))
+      precisa_notificar=1
     fi
-    imprimir_json "$ICONE_QUENTE ${cpu}°" "$dica" "sim"
-    return
+  elif (( cpu < REARMAR_TEMP )) && [[ "$EM_ALERTA" == "1" ]]; then
+    EM_ALERTA=0
   fi
 
-  if (( cpu < REARMAR_TEMP )); then
-    rm -f "$ARQUIVO_EM_ALERTA"
+  if [[ "$EM_ALERTA" != "$em_alerta_antes" || "$CONTADOR" != "$contador_antes" ]]; then
+    escrever_estado
   fi
-  imprimir_json "$ICONE_NORMAL ${cpu}°" "$dica" "nao"
+  destravar_estado
+
+  # notify-send é um programa externo: roda depois de destravar_estado,
+  # nunca com a trava ainda segurada.
+  if (( precisa_notificar == 1 )); then
+    notificar "$cpu"
+  fi
+
+  if (( cpu >= ALERTA_TEMP )); then
+    imprimir_json "$ICONE_QUENTE ${cpu}°" "$dica" "sim"
+  else
+    imprimir_json "$ICONE_NORMAL ${cpu}°" "$dica" "nao"
+  fi
 }
 
 # mostrar_alertas: modo do widget que mostra quantos alertas aconteceram.
@@ -264,7 +301,10 @@ mostrar_temperatura() {
 mostrar_alertas() {
   local contador palavra aceso
 
-  contador=$(ler_contador)
+  travar_estado
+  ler_estado
+  contador=$CONTADOR
+  destravar_estado
 
   # Sem alertas: não imprime nada e o widget some da barra.
   # (Não dá para imprimir {"text":""}: a barra trata texto vazio como
@@ -288,9 +328,14 @@ mostrar_alertas() {
     "$contador alerta(s) de temperatura. Clique para zerar." "$aceso"
 }
 
-# Zera o contador de alertas.
+# Zera o contador de alertas. Preserva EM_ALERTA, pra não cortar um
+# episódio de temperatura alta em andamento.
 zerar_alertas() {
-  rm -f "$ARQUIVO_CONTADOR"
+  travar_estado
+  ler_estado
+  CONTADOR=0
+  escrever_estado
+  destravar_estado
 }
 
 # mostrar_ajuda: mostra o texto de ajuda. Em vez de repetir o texto aqui,
